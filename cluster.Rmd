@@ -1,0 +1,218 @@
+---
+title: "Untitled"
+author: "Fumin Li"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+Task1
+
+```{r}
+library(cluster)   # for clusGap
+library(ggplot2)
+library(dplyr)
+
+# 1. Generate clustered data in n-dim hypercube
+
+generate_hypercube_clusters <- function(n, k, side_length, noise_sd = 1.0) {
+  # Cluster centers: the "positive corners" of n-d hypercube
+  centers <- diag(rep(side_length, n))
+  
+  # For each cluster, generate k samples around the center
+  data_list <- lapply(1:n, function(i) {
+    matrix(rnorm(k * n, mean = centers[i, ], sd = noise_sd), ncol = n, byrow = TRUE)
+  })
+  
+  data <- do.call(rbind, data_list)
+  labels <- rep(1:n, each = k)
+  
+  return(list(X = data, y = labels))
+}
+
+# 2. Run clusGap for given dataset
+
+estimate_num_clusters <- function(X, maxK = 10) {
+  set.seed(123)
+  gap <- clusGap(X, FUN = kmeans, nstart = 20, K.max = maxK, B = 50, iter.max = 50)
+  bestK <- maxSE(gap$Tab[,"gap"], gap$Tab[,"SE.sim"], method = "Tibs2001SEmax")
+  return(list(bestK = bestK, gap = gap))
+}
+
+# 3. Simulation loop
+
+run_simulation <- function() {
+  k <- 100
+  noise_sd <- 1.0
+  dims <- c(6, 5, 4, 3, 2)
+  side_lengths <- 10:1
+  
+  results <- data.frame()
+  
+  for (n in dims) {
+    for (L in side_lengths) {
+      cat(sprintf("Running n=%d, side_length=%d\n", n, L))
+      dat <- generate_hypercube_clusters(n, k, L, noise_sd)
+      est <- estimate_num_clusters(dat$X, maxK = 10)
+      results <- rbind(results, 
+                       data.frame(n = n, side_length = L, 
+                                  est_clusters = est$bestK, true_clusters = n))
+    }
+  }
+  return(results)
+}
+
+# 4. Visualization
+
+plot_results <- function(results) {
+  ggplot(results, aes(x = side_length, y = est_clusters, color = factor(n))) +
+    geom_line(size = 1) +
+    geom_point(size = 2) +
+    geom_hline(aes(yintercept = true_clusters), linetype = "dashed", color = "black") +
+    scale_x_reverse(breaks = 10:1) +
+    labs(
+      title = "Estimated Number of Clusters vs. Side Length",
+      x = "Side length (clusters closer → smaller)",
+      y = "Estimated number of clusters (Gap Statistic)",
+      color = "Dimension (n)"
+    ) +
+    theme_minimal(base_size = 14)
+}
+
+# 5. Run 
+
+results <- run_simulation()
+print(results)
+plot_results(results)
+
+```
+
+The plot shows that for all tested dimensions (n = 2–6), the Gap Statistic correctly identifies the true number of clusters when the side length is large (>=4). As the clusters move closer (side length < 4), the estimated number of clusters sharply drops to 1, indicating that the algorithm can no longer separate them. Therefore, the critical transition occurs around side length 3–4, below which cluster distinction becomes unreliable.
+
+Task2
+```{r}
+
+
+library(cluster)
+library(ggplot2)
+library(plotly)
+library(Matrix)
+
+
+# 1. Generate concentric shells in 3D
+
+generate_shell_clusters <- function(n_shells, k_per_shell, max_radius, noise_sd = 0.1) {
+
+  radii <- seq(1, max_radius, length.out = n_shells)
+  data <- NULL
+  labels <- NULL
+  
+  for (i in seq_along(radii)) {
+    r <- radii[i]
+    theta <- runif(k_per_shell, 0, 2 * pi)
+    phi <- acos(runif(k_per_shell, -1, 1))
+    
+    x <- r * sin(phi) * cos(theta)
+    y <- r * sin(phi) * sin(theta)
+    z <- r * cos(phi)
+    
+    shell <- cbind(x, y, z) + matrix(rnorm(3 * k_per_shell, 0, noise_sd), ncol = 3)
+    data <- rbind(data, shell)
+    labels <- c(labels, rep(i, k_per_shell))
+  }
+  
+  return(list(X = data, y = labels))
+}
+
+
+# 2. Spectral Clustering Function
+
+spectral_clustering <- function(X, k, d_threshold = 1) {
+  n <- nrow(X)
+  
+  dist_mat <- as.matrix(dist(X))
+  A <- matrix(0, n, n)
+  A[dist_mat < d_threshold] <- 1
+  diag(A) <- 0
+
+  D <- diag(rowSums(A))
+  D_inv_sqrt <- diag(1 / sqrt(diag(D) + 1e-8))
+  L_sym <- diag(n) - D_inv_sqrt %*% A %*% D_inv_sqrt
+
+  eig <- eigen(L_sym, symmetric = TRUE)
+  eigvecs <- eig$vectors[, (n - k + 1):n] 
+
+  set.seed(123)
+  km <- kmeans(eigvecs, centers = k, nstart = 20, iter.max = 50)
+  return(km$cluster)
+}
+
+
+# 3. Wrapper for clusGap compatibility
+
+spectral_wrapper <- function(x, k, ...) {
+  labels <- spectral_clustering(x, k, d_threshold = 1)
+  
+  centers <- aggregate(x, by = list(labels), mean)[, -1]
+  wss <- sum(sapply(unique(labels), function(c) {
+    sum(rowSums((x[labels == c, ] - centers[c, ])^2))
+  }))
+  
+  return(list(cluster = labels, tot.withinss = wss))
+}
+# 4. Simulation over radii
+run_simulation_shells <- function() {
+  n_shells <- 4
+  k_per_shell <- 100
+  noise_sd <- 0.1
+  d_threshold <- 1
+  radii <- 10:1
+  
+  results <- data.frame()
+  
+  for (r in radii) {
+    cat(sprintf("Running spectral clustering with max_radius = %d\n", r))
+    dat <- generate_shell_clusters(n_shells, k_per_shell, r, noise_sd)
+    
+    gap <- clusGap(dat$X, FUN = spectral_wrapper, nstart = 1, K.max = 10, B = 30)
+    bestK <- maxSE(gap$Tab[, "gap"], gap$Tab[, "SE.sim"], method = "Tibs2001SEmax")
+    
+    results <- rbind(results, data.frame(max_radius = r, est_clusters = bestK, true_clusters = n_shells))
+  }
+  
+  return(results)
+}
+
+# 5. Visualization
+plot_results_shells <- function(results) {
+  ggplot(results, aes(x = max_radius, y = est_clusters)) +
+    geom_line(size = 1, color = "#0072B2") +
+    geom_point(size = 2, color = "#E69F00") +
+    geom_hline(aes(yintercept = true_clusters), linetype = "dashed", color = "black") +
+    scale_x_reverse(breaks = 10:1) +
+    labs(
+      title = "Spectral Clustering: Estimated Number of Shells vs Max Radius",
+      x = "Maximum Radius (shells closer → smaller)",
+      y = "Estimated number of clusters"
+    ) +
+    theme_minimal(base_size = 14)
+}
+
+# 6. 3D visualization for one dataset
+plot_shells_3D <- function(X, labels) {
+  plot_ly(
+    x = X[,1], y = X[,2], z = X[,3],
+    color = as.factor(labels),
+    type = "scatter3d", mode = "markers",
+    marker = list(size = 3)
+  )
+}
+
+
+# 7.
+results_shells <- run_simulation_shells()
+print(results_shells)
+plot_results_shells(results_shells)
+
+```
+
+The plot shows that the spectral clustering algorithm can correctly identify four shells only when the maximum radius is large enough for clear separation between shells. When the maximum radius becomes smaller than about seven, the estimated number of clusters quickly drops to one or two, meaning the shells are no longer distinguishable because they overlap. The small fluctuations at larger radii indicate minor instability in the eigenvalue step when the shells are close to the distance threshold. Overall, spectral clustering begins to fail once the shells are too close compared with the fixed distance threshold of one.
